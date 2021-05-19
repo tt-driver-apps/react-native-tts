@@ -1,29 +1,48 @@
 package net.no_mad.tts;
 
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
-import android.media.AudioManager;
-import android.os.Build;
-import android.os.Bundle;
+import android.app.Activity;
 import android.content.Intent;
 import android.content.ActivityNotFoundException;
-import android.app.Activity;
-import android.net.Uri;
-import android.speech.tts.TextToSpeech;
-import android.speech.tts.UtteranceProgressListener;
-import android.speech.tts.Voice;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
+import android.speech.tts.Voice;
+import android.util.Log;
+
 import com.facebook.react.bridge.*;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
+import java.io.File;
+import java.io.IOException;
+import java.lang.InterruptedException;
+import java.lang.Math;
+import java.lang.NullPointerException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
 public class TextToSpeechModule extends ReactContextBaseJavaModule {
+
+    private static final String TAG = "TextToSpeechModule";
 
     private TextToSpeech tts;
     private Boolean ready = null;
@@ -39,6 +58,21 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
     private Map<String, Locale> localeLanguageMap;
 
     private String currentEngineName = null;
+
+    private final Executor executor = Executors.newSingleThreadExecutor();
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition condition = lock.newCondition();
+    private boolean isTtsCompleted = false;
+
+    private static final long UNITY_GAIN_Q8p24 = (1 << 24);
+    private static final long audioGainClipRegion = (long)(0.9441 * UNITY_GAIN_Q8p24); // -0.5dB = 0.9441 (10 ^ (-0.5/20))
+    private long audioGain = (long)(1.6788 * UNITY_GAIN_Q8p24); // 4.5dB = 1.6788 (10 ^ (4.5/20))
+    private long largestSample = 0;
+    private AudioTrack audioTrack;
+
+    private static final boolean enableTestCode = false;
+    private int clippedSamplesCount = 0;
+    private int sampleCount = 0;
 
     public TextToSpeechModule(ReactApplicationContext reactContext) {
         super(reactContext);
@@ -71,6 +105,7 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
         });
         currentEngineName = tts.getDefaultEngine();
 
+        setInitialAudioGain();
         setUtteranceProgress();
     }
 
@@ -79,31 +114,83 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
         {
             tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
                 @Override
+                public void onBeginSynthesis (String utteranceId, int sampleRateInHz, int audioFormat, int channelCount) {
+                    int bufferSizeInBytes = AudioTrack.getMinBufferSize(sampleRateInHz, audioFormat, AudioFormat.ENCODING_PCM_16BIT);
+                    if (bufferSizeInBytes == AudioTrack.ERROR_BAD_VALUE || bufferSizeInBytes == AudioTrack.ERROR) {
+                        bufferSizeInBytes = 4096;
+                    }
+
+                    AudioAttributes audioTrackAudioAttributes = new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build();
+
+                    AudioFormat audioTrackAudioFormat = new AudioFormat.Builder()
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .setSampleRate(sampleRateInHz)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .build();
+
+                    try {
+                        audioTrack = new AudioTrack(audioTrackAudioAttributes, audioTrackAudioFormat, bufferSizeInBytes, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE);
+                        if (audioTrack == null || audioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+                            tts.stop();
+                        } else {
+                            try {
+                                audioTrack.play();
+                            } catch (IllegalStateException e) {
+                                tts.stop();
+                            }
+                        }
+                    } catch (IllegalArgumentException e) {
+                        tts.stop();
+                    }
+                }
+
+                @Override
                 public void onStart(String utteranceId) {
-                    // Request audio focus here instead of earlier on when requesting to speak an utterance.
-                    // This avoids in case of a queued speak requests that audio focus is requested before
-                    // the still playing sentence will abandon focus (and stops ducking music). This ensures
-                    // that each queued sentence will have a proper request/abandon sequence and duck music.
-                    requestFocus();
                     sendEvent("tts-start", utteranceId);
                 }
 
                 @Override
                 public void onDone(String utteranceId) {
-                    abandonFocus();
+                    audioDone();
                     sendEvent("tts-finish", utteranceId);
                 }
 
                 @Override
                 public void onError(String utteranceId) {
-                    abandonFocus();
+                    audioDone();
                     sendEvent("tts-error", utteranceId);
                 }
 
                 @Override
                 public void onStop(String utteranceId, boolean interrupted) {
-                    abandonFocus();
+                    audioDone();
                     sendEvent("tts-cancel", utteranceId);
+                }
+
+                @Override
+                public void onAudioAvailable(String utteranceId, byte[] audio) {
+                    if (audioTrack != null) {
+                        processAudio(audio);
+
+                        int offset = 0;
+                        while (offset < audio.length) {
+                            int written = audioTrack.write(audio, offset, audio.length - offset);
+                            if (written <= 0) {
+                                tts.stop();
+                                break;
+                            }
+                            offset += written;
+                        }
+                    } else {
+                        tts.stop();
+                    }
+
+                    if (enableTestCode) {
+                        writeAudioToFile(audio);
+                    }
                 }
             });
         }
@@ -217,12 +304,32 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
 
         String utteranceId = Integer.toString(utterance.hashCode());
 
-        int speakResult = speak(utterance, utteranceId, params);
-        if(speakResult == TextToSpeech.SUCCESS) {
-            promise.resolve(utteranceId);
-        } else {
-            resolvePromiseWithStatusCode(speakResult, promise);
-        }
+        // queue TTS utterance using single thread executor so that audio focus can be requested early
+        // when requesting to speak an utterance instead of waiting for it to be realy started to avoid
+        // nested requests when an utterance is requested to be spoken while another is still playing
+        executor.execute(() -> {
+            if (enableTestCode) {
+                testCodeReset();
+            }
+
+            isTtsCompleted = false;
+            int speakResult = speak(utterance, utteranceId, params);
+            if(speakResult == TextToSpeech.SUCCESS) {
+                while (!isTtsCompleted) {
+                    lock.lock();
+                    try {
+                        condition.await();
+                    } catch (InterruptedException e) {
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+                updateAudioGain();
+                promise.resolve(utteranceId);
+            } else {
+                resolvePromiseWithStatusCode(speakResult, promise);
+            }
+        });
     }
 
     @ReactMethod
@@ -287,6 +394,7 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
                 for(Voice voice: tts.getVoices()) {
                     if(voice.getName().equals(voiceId)) {
                         int result = tts.setVoice(voice);
+                        setInitialAudioGain();
                         resolvePromiseWithStatusCode(result, promise);
                         return;
                     }
@@ -365,6 +473,7 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
                 }
             }, engineName);
 
+            setInitialAudioGain();
             setUtteranceProgress();
         } else {
             promise.reject("not_found", "The selected engine was not found");
@@ -495,19 +604,22 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
                 audioStreamType = AudioManager.USE_DEFAULT_STREAM_TYPE;
         }
 
+        requestFocus();
+
         if (Build.VERSION.SDK_INT >= 21) {
-            Bundle params = new Bundle();
-            params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, audioStreamType);
-            params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume);
-            params.putFloat(TextToSpeech.Engine.KEY_PARAM_PAN, pan);
-            return tts.speak(utterance, TextToSpeech.QUEUE_ADD, params, utteranceId);
+            try {
+                // synthesizeToFile requires a valid File, the audio written will not be used (audio is taken from onAudioAvailable)
+                File devNull = new File("/dev/null");
+                Bundle params = new Bundle();
+                params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, audioStreamType);
+                params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume);
+                params.putFloat(TextToSpeech.Engine.KEY_PARAM_PAN, pan);
+                return tts.synthesizeToFile(utterance, params, devNull, utteranceId);
+            } catch (NullPointerException e) {
+                return TextToSpeech.ERROR;
+            }
         } else {
-            HashMap<String, String> params = new HashMap();
-            params.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId);
-            params.put(TextToSpeech.Engine.KEY_PARAM_STREAM, String.valueOf(audioStreamType));
-            params.put(TextToSpeech.Engine.KEY_PARAM_VOLUME, String.valueOf(volume));
-            params.put(TextToSpeech.Engine.KEY_PARAM_PAN, String.valueOf(pan));
-            return tts.speak(utterance, TextToSpeech.QUEUE_ADD, params);
+            return TextToSpeech.ERROR;
         }
     }
 
@@ -520,37 +632,49 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
     }
 
     private void requestFocus() {
-        if (ducking) {
-            // Request audio focus for playback
-            AudioAttributes audioAttributes = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+        // Set TTS 'player' audio attribute usage to AudioAttributes.USAGE_MEDIA for playback on Android Auto music volume level,
+        // set to AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE for playback on Android Auto music navigation guidance volume level.
+        // Note 1: navigation guidance volume level only has effect on Android Auto so far and can only be changed when audio is playing on it.
+        // Note 2: audio focus request audio attributes usage will be AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE to get
+        // proper audio focus change for Android Auto.
+        AudioAttributes ttsAudioAttributes = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build();
+        tts.setAudioAttributes(ttsAudioAttributes);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            AudioAttributes audioFocusAudioAttributes = new AudioAttributes.Builder()
+                  .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                  .build();
+            audioFocusRequest = new AudioFocusRequest
+                    .Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(audioFocusAudioAttributes)
+                    .setAcceptsDelayedFocusGain(false)
+                    .setOnAudioFocusChangeListener(audioFocusChangeListener)
                     .build();
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                audioFocusRequest = new AudioFocusRequest
-                        .Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                        .setAudioAttributes(audioAttributes)
-                        .setAcceptsDelayedFocusGain(false)
-                        .setOnAudioFocusChangeListener(audioFocusChangeListener)
-                        .build();
 
-                audioFocus = audioManager.requestAudioFocus(audioFocusRequest);
-            } else {
-                tts.setAudioAttributes(audioAttributes);
-                audioFocus = audioManager.requestAudioFocus(audioFocusChangeListener,
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
-                );
-            }
+            audioFocus = audioManager.requestAudioFocus(audioFocusRequest);
+        } else {
+            audioFocus = audioManager.requestAudioFocus(audioFocusChangeListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+            );
+        }
 
-            if (audioFocus != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                tts.stop();
-            }
+        if (audioFocus == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            // Delay so that the ducking of music will have had the initial effect.
+            try {
+                Thread.sleep(450);
+            } catch (Exception e) {}
+        } else {
+            tts.stop();
         }
     }
 
     private void abandonFocus() {
-        if (ducking && audioFocus == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+        if (audioFocus == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
             audioFocus = AudioManager.AUDIOFOCUS_REQUEST_FAILED;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 audioManager.abandonAudioFocusRequest(audioFocusRequest);
@@ -559,6 +683,23 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
                 audioManager.abandonAudioFocus(audioFocusChangeListener);
             }
         }
+    }
+
+    private void ttsCompleted() {
+        isTtsCompleted = true;
+        lock.lock();
+        condition.signal();
+        lock.unlock();
+    }
+
+    private void audioDone() {
+        if (audioTrack != null) {
+            audioTrack.stop();
+            audioTrack.release();
+            audioTrack = null;
+        }
+        abandonFocus();
+        ttsCompleted();
     }
 
     private String audioFocusResultToString(int audioFocusResult) {
@@ -571,5 +712,96 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
                 return "AUDIOFOCUS_REQUEST_DELAYED";
         }
         return "Unknown audio focus result: " + audioFocusResult;
+    }
+
+    private void processAudio(byte[] audio) {
+        // convert to array of 64 bit samples in Q8.24 format
+        long[] samples = new long[audio.length / 2];
+        for (int i = 0, j = 0; i < samples.length; i++, j += 2) {
+            short sample = (short)(((short)(audio[j+1]) << 8) | ((short)(audio[j+0]) & 0xff)) ;
+            samples[i] = (long)(sample) << 9;
+        }
+
+        processGain(samples);
+
+        // convert array of 64 bit samples back to 16 bit in byte array
+        for (int i = 0, j = 0; i < samples.length; i++, j += 2) {
+            int sample = (int)(samples[i] >> 9);
+
+            // hard clamp to short
+            if (((sample >> 15) ^ (sample >> 31)) != 0) {
+                sample = 0x7FFF ^ (sample >> 31);
+
+                if (enableTestCode) {
+                    clippedSamplesCount++;
+                }
+            }
+
+            audio[j+1] = (byte)((sample >> 8) & 0xff);
+            audio[j+0] = (byte)(sample & 0xff);
+        }
+    }
+
+    private void processGain(long[] audio) {
+        if (enableTestCode) {
+            sampleCount += audio.length;
+        }
+
+        for (int i = 0; i < audio.length; i++) {
+            long sample = audio[i];
+            audio[i] = (sample * audioGain) >> 24;
+
+            // track largest sample for crude 'automatic' volume adjustements
+            if (sample < 0) {
+                sample = -sample;
+            }
+            if (sample > largestSample) {
+                largestSample = sample;
+            }
+        }
+    }
+
+    private void setInitialAudioGain() {
+        if (currentEngineName.toLowerCase().contains("com.google")) {
+            audioGain = (long)(1.6788 * UNITY_GAIN_Q8p24); // 4.5dB = 1.6788 (10 ^ (4.5/20))
+        } else {
+            audioGain = UNITY_GAIN_Q8p24; // 0dB = 1.0 (10 ^ (0/20))
+        }
+        largestSample = 0;
+
+        if (enableTestCode) {
+            Log.d(TAG, "Initial audio gain " + Math.log10((double)audioGain / (double)UNITY_GAIN_Q8p24) * 20.0 + "dB for engine " + currentEngineName);
+        }
+    }
+
+    private void testCodeReset() {
+        clippedSamplesCount = 0;
+        sampleCount = 0;
+    }
+
+    private void updateAudioGain() {
+        if (largestSample != 0) {
+            // Sample and gain values are in Q8.24 format
+            audioGain = (UNITY_GAIN_Q8p24 * UNITY_GAIN_Q8p24) / ((largestSample * audioGainClipRegion) >> 24);
+        }
+        if (enableTestCode) {
+            Log.d(TAG, "update gain " + (double)audioGain / (double)UNITY_GAIN_Q8p24 + " clipped: (" + sampleCount + " => " + clippedSamplesCount + " = " + (((float)clippedSamplesCount / (float)sampleCount) * 100.0f) + " %)");
+            Log.d(TAG, "update gain " + Math.log10((double)audioGain / (double)UNITY_GAIN_Q8p24) * 20.0 + " dB, largest sample " + (double)largestSample / (double)UNITY_GAIN_Q8p24);
+        }
+    }
+
+    private void writeAudioToFile(byte[] audio) {
+        String dirPath = getReactApplicationContext().getFilesDir().getPath();
+        try {
+            Files.createDirectory(Paths.get(dirPath));
+        } catch (IOException e) {}
+        try {
+            Files.createFile(Paths.get(dirPath, "platformTTS.raw"));
+        } catch (IOException e) {}
+        try {
+            Files.write(Paths.get(dirPath, "platformTTS.raw"), audio, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to write audio to file e:" + e);
+        }
     }
 }
