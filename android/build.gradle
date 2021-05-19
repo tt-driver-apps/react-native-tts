@@ -4,7 +4,7 @@ def safeExtGet(prop, fallback) {
 
 buildscript {
     repositories {
-        maven { url "https://artifactory.navkit-pipeline.tt3.com/artifactory/maven-remotes" }
+        jcenter()
     }
 
     dependencies {
