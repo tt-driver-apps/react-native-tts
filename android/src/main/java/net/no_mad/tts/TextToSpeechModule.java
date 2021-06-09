@@ -762,7 +762,7 @@ public class TextToSpeechModule extends ReactContextBaseJavaModule {
     }
 
     private void setInitialAudioGain() {
-        if (currentEngineName.toLowerCase().contains("com.google")) {
+        if (currentEngineName != null && currentEngineName.toLowerCase().contains("com.google")) {
             audioGain = (long)(1.6788 * UNITY_GAIN_Q8p24); // 4.5dB = 1.6788 (10 ^ (4.5/20))
         } else {
             audioGain = UNITY_GAIN_Q8p24; // 0dB = 1.0 (10 ^ (0/20))
